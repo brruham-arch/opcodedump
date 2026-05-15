@@ -25,88 +25,111 @@ static void logff_(const char* fmt, ...) {
 extern "C" {
 
 EXPORT void* __GetModInfo() {
-    static const char* info = "opcodedump|1.0|CLEO ScriptSpace Opcode Dumper|brruham";
+    static const char* info = "opcodedump|1.1|CLEO ScriptSpace Opcode Dumper|brruham";
     return (void*)info;
 }
 
 EXPORT void OnModPreLoad() {
     remove(LOGFILE);
     remove(OUTFILE);
-    logf_("[OD] OnModPreLoad v1.0");
+    logf_("[OD] OnModPreLoad v1.1");
 }
 
 EXPORT void OnModLoad() {
     logf_("[OD] OnModLoad mulai");
 
-    // Buka libCLEO — symbolnya tidak di-strip
+    // Load Dobby untuk resolve C++ mangled symbol
+    void* hDobby = dlopen("libdobby.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!hDobby) { logf_("[OD] ERROR: libdobby"); return; }
+
+    auto resolver = (void*(*)(const char*, const char*))
+                        dlsym(hDobby, "DobbySymbolResolver");
+    if (!resolver) { logf_("[OD] ERROR: DobbySymbolResolver"); return; }
+
+    // Load libCLEO
     void* hCLEO = dlopen("libCLEO.so", RTLD_NOW | RTLD_NOLOAD);
     if (!hCLEO) hCLEO = dlopen("libCLEO.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!hCLEO) { logf_("[OD] ERROR: libCLEO tidak bisa dibuka"); return; }
+    if (!hCLEO) { logf_("[OD] ERROR: libCLEO"); return; }
     logff_("[OD] hCLEO=%p", hCLEO);
 
-    // Ambil pointer ke ScriptSpace
-    // ScriptSpace = array of uint8 = bytecode buffer utama
-    uint8_t** ppSpace = (uint8_t**)dlsym(hCLEO, "_ZN11CTheScripts11ScriptSpaceE");
-    if (!ppSpace) { logf_("[OD] ERROR: ScriptSpace tidak ditemukan"); return; }
-    logff_("[OD] ppSpace=%p", ppSpace);
+    // Coba resolve via DobbySymbolResolver (lebih handal untuk mangled)
+    void* pSpace = resolver("libCLEO.so", "_ZN11CTheScripts11ScriptSpaceE");
+    logff_("[OD] DobbyResolver ScriptSpace=%p", pSpace);
 
-    uint8_t* space = *ppSpace;
-    if (!space) {
-        // Mungkin ScriptSpace adalah array statis, bukan pointer
-        // Coba treat ppSpace langsung sebagai buffer
-        space = (uint8_t*)ppSpace;
-        logf_("[OD] ScriptSpace: treat sebagai array statis");
+    // Fallback: coba dlsym biasa
+    if (!pSpace) {
+        pSpace = dlsym(hCLEO, "_ZN11CTheScripts11ScriptSpaceE");
+        logff_("[OD] dlsym ScriptSpace=%p", pSpace);
     }
-    logff_("[OD] ScriptSpace buffer=%p", space);
 
-    // Scan buffer — format instruksi CLEO/GTA SA:
-    // [2 byte opcode][parameter...]
-    // Panjang parameter bervariasi per opcode, tapi kita hanya butuh opcode ID
-    // Strategi: scan tiap 2 byte sebagai potential opcode, filter range valid
-    // Opcode GTA SA: 0x0000 - 0x0FFF (standar) + 0x0A00-0x0FFF (CLEO extended)
+    if (!pSpace) {
+        logf_("[OD] ERROR: ScriptSpace tidak ditemukan via keduanya");
+        return;
+    }
 
-    // Gunakan bitmask 4096 bit = 512 byte untuk track opcode yang sudah ditemukan
-    uint8_t seen[4096 / 8] = {0};  // bit array untuk opcode 0x0000-0x0FFF
+    // ScriptSpace bisa berupa:
+    // 1. Pointer ke buffer (double pointer)
+    // 2. Array statis (pointer langsung ke data)
+    // Coba keduanya dan log hasilnya
+
+    uint8_t* space_direct = (uint8_t*)pSpace;
+    uint8_t* space_deref  = *(uint8_t**)pSpace;
+
+    logff_("[OD] space_direct[0..3] = %02X %02X %02X %02X",
+           space_direct[0], space_direct[1],
+           space_direct[2], space_direct[3]);
+
+    if (space_deref) {
+        logff_("[OD] space_deref[0..3] = %02X %02X %02X %02X",
+               space_deref[0], space_deref[1],
+               space_deref[2], space_deref[3]);
+    }
+
+    // Pilih buffer yang lebih masuk akal
+    // Opcode pertama GTA SA main.scm biasanya 0x0002 (GOTO) atau 0x0001
+    uint8_t* space = space_direct;
+    uint16_t op0_direct = (uint16_t)(space_direct[0] | (space_direct[1] << 8)) & 0x7FFF;
+    if (space_deref) {
+        uint16_t op0_deref = (uint16_t)(space_deref[0] | (space_deref[1] << 8)) & 0x7FFF;
+        // Deref lebih masuk akal jika opcode pertama dalam range valid
+        if (op0_deref <= 0x0FFF && op0_direct > 0x0FFF) {
+            space = space_deref;
+            logf_("[OD] Pakai space_deref");
+        } else {
+            logf_("[OD] Pakai space_direct");
+        }
+    }
+
+    // Scan opcode
+    uint8_t seen[4096 / 8] = {0};
     int count = 0;
 
     for (size_t i = 0; i + 1 < SCRIPT_SPACE_SIZE; i += 2) {
         uint16_t opcode = (uint16_t)(space[i] | (space[i+1] << 8));
-
-        // Strip bit 7 MSB (negasi kondisi di CLEO)
-        uint16_t clean = opcode & 0x7FFF;
-
-        // Filter range valid opcode GTA SA + CLEO
+        uint16_t clean  = opcode & 0x7FFF;
         if (clean > 0x0FFF) continue;
-
-        // Cek apakah sudah pernah dicatat
         int idx = clean / 8;
         int bit = clean % 8;
         if (seen[idx] & (1 << bit)) continue;
-
         seen[idx] |= (1 << bit);
         count++;
     }
 
-    logff_("[OD] Scan selesai, %d opcode unik ditemukan", count);
+    logff_("[OD] %d opcode unik ditemukan", count);
 
-    // Tulis hasil ke file
     FILE* out = fopen(OUTFILE, "w");
-    if (!out) { logf_("[OD] ERROR: tidak bisa buka output file"); return; }
+    if (!out) { logf_("[OD] ERROR: fopen output"); return; }
 
-    fprintf(out, "# CLEO ScriptSpace Opcode Dump\n");
-    fprintf(out, "# Total opcode unik: %d\n\n", count);
-
+    fprintf(out, "# CLEO ScriptSpace Opcode Dump v1.1\n");
+    fprintf(out, "# Total: %d opcode unik\n\n", count);
     for (int op = 0; op <= 0x0FFF; op++) {
-        int idx = op / 8;
-        int bit = op % 8;
-        if (seen[idx] & (1 << bit)) {
+        if (seen[op/8] & (1 << (op%8)))
             fprintf(out, "0x%04X\n", op);
-        }
     }
-
     fclose(out);
-    logff_("[OD] Hasil disimpan ke %s", OUTFILE);
-    logf_("[OD] OnModLoad SELESAI");
+
+    logff_("[OD] Disimpan ke %s", OUTFILE);
+    logf_("[OD] SELESAI");
 }
 
 } // extern "C"
