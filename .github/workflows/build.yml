@@ -1,0 +1,25 @@
+name: Build OpcoDump
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+          add-to-path: true
+      - run: |
+          $ANDROID_NDK_ROOT/ndk-build \
+            NDK_PROJECT_PATH=. \
+            APP_BUILD_SCRIPT=./jni/Android.mk \
+            NDK_APPLICATION_MK=./jni/Application.mk
+      - run: ls -lh libs/armeabi-v7a/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libopcodedump-arm32
+          path: libs/armeabi-v7a/libopcodedump.so
+          retention-days: 14
